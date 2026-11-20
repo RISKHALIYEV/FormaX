@@ -1,0 +1,120 @@
+name: FormaX Android APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find and extract FormaX ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP_FILE="$(find . -maxdepth 1 -type f -iname '*.zip' -print -quit)"
+          if [ -z "$ZIP_FILE" ]; then
+            echo "::error::ZIP file not found in repository root."
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/formax"
+          unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/formax"
+
+          PROJECT_DIR="$(find "$RUNNER_TEMP/formax" -type f -path '*/scripts/sync-android.mjs' -print -quit | xargs -r dirname | xargs -r dirname)"
+          if [ -z "$PROJECT_DIR" ] || [ ! -f "$PROJECT_DIR/package.json" ]; then
+            echo "::error::FormaX project not found. ZIP must contain package.json and scripts/sync-android.mjs."
+            find "$RUNNER_TEMP/formax" -maxdepth 5 -type f | head -n 100
+            exit 1
+          fi
+
+          if [ ! -f "$PROJECT_DIR/apps/android/gradlew" ]; then
+            echo "::error::Android Gradle wrapper not found in apps/android."
+            exit 1
+          fi
+
+          rsync -a --delete --exclude='.git' "$PROJECT_DIR/" "$GITHUB_WORKSPACE/"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Locate Android SDK tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [ -z "$SDK_ROOT" ]; then
+            for candidate in "$HOME/Android/Sdk" "/usr/local/lib/android/sdk" "/opt/android-sdk"; do
+              if [ -d "$candidate" ]; then SDK_ROOT="$candidate"; break; fi
+            done
+          fi
+          if [ -z "$SDK_ROOT" ] || [ ! -d "$SDK_ROOT" ]; then
+            echo "::error::Android SDK directory was not found on this GitHub runner."
+            exit 1
+          fi
+
+          SDKMANAGER="$(find "$SDK_ROOT" -type f -name sdkmanager -print -quit)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager was not found in $SDK_ROOT."
+            find "$SDK_ROOT" -maxdepth 4 -type d | head -n 80
+            exit 1
+          fi
+
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+
+      - name: Install Android platform and build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Install JavaScript packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Build FormaX web app
+        run: npm run build
+
+      - name: Copy web build into Android app
+        run: node scripts/sync-android.mjs
+
+      - name: Build APK
+        shell: bash
+        working-directory: apps/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Save APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: FormaX-APK
+          path: apps/android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
